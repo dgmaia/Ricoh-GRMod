@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { color, EXTRA_NAME_MAX, GR3X_RATIO_NAME_MAX, halateRgba, halationLight, MAX_EXTRA_SLOTS, SHUTDOWN_H, SHUTDOWN_NAME_MAX, SHUTDOWN_W } from '@grmod/core';
+import { batteryIcons, color, EXTRA_NAME_MAX, GR3X_RATIO_NAME_MAX, halateRgba, halationLight, isCameraGrid, MAX_EXTRA_SLOTS, SHUTDOWN_H, SHUTDOWN_NAME_MAX, SHUTDOWN_W } from '@grmod/core';
 import type { SlotId } from '@grmod/core';
 import type { ReactNode } from 'react';
 import { DropZone, FileButton, Ico, IconCanvas, Menu, Prop, RatioIcon, RgbCanvas, Segmented, Select, Switch } from './components';
@@ -12,17 +12,17 @@ import { onUiScale, uiScale } from './fit';
 import { applySlot } from './preview';
 import {
   addRatio, addWallFiles, askForOfficial, bridgeLoaded, loadFirmwareFile, loadIconImage, loadPresetFile, loadPreviewFile, moveWall, nameProblem, openCrop, outputFirmware, previewPhoto, removePreset, removeWall,
-  maxRatios, ratioName, ratioProblem, removeRatio, setActiveRatio, setActiveSlot, setCrop, setIcon, setName, setPreviewMode, setRatio, setRatioBackdrop, useStore, wallBitmap,
+  maxRatios, ratioName, ratioProblem, removeRatio, setActiveRatio, setActiveSlot, setCrop, setIcon, setName, setPreviewMode, setRatio, setRatioBackdrop, liveViewOf, setLiveView, useStore, wallBitmap,
   setSoft,
   setDateStamp,
   setMonoUnlock,
-  setDirectFlash, setAdjSlots, adjSlotsOf, setHdr, setExposurePreview, setBrightAuto,
+  setDirectFlash, setAdjSlots, adjSlotsOf, setHdr, setExposurePreview, setBrightAuto, setBattery, setCustomGrid, setGridLine,
   extraName, extraNameProblem, extraProblem, halationOf, removeExtraSlot, setExtraCount, setExtraName, setHalation, slotOf,
   filmCountChoosable, removeFilm, setFilmCount,
   hasLookLayout, isGr3, KEEP_VISIBLE, lookHiddenNow, lookMonoOnly, lookName, lookOrderAvailable, lookOrderNow, moveLook, moveLookTo, resetLookLayout, setLookHidden,
   setWallName, wallMax, wallMenuProblem,
 } from './store';
-import type { ExtraSlot, RatioItem, SlotKey, WallItem } from './store';
+import type { ExtraSlot, LiveView, RatioItem, SlotKey, WallItem } from './store';
 
 const isPreset = (f: File): boolean => /\.(xmp|cube)$/i.test(f.name);
 const isFirmware = (f: File): boolean => /\.bin$/i.test(f.name);
@@ -1027,6 +1027,11 @@ function RatioRow({ r, active, tour }: { r: RatioItem; active: boolean; tour?: s
 function RatioPane({ r }: { r?: RatioItem }) {
   const rev = useStore((s) => s.photoRev);
   const backdrop = useStore((s) => s.ratioBackdrop);
+  // With the live-view shade the camera darkens the outside (black at 50 % or grey at 25 %); the preview does the same.
+  const shade = useStore((s) => s.ratioShade && !!s.info?.features.ratioShade);
+  const tone = useStore((s) => s.ratioShadeTone);
+  // The GR IV's live view of an added ratio is black outside the photo area; the preview shows it so.
+  const gr4 = useStore((s) => s.info?.family === 'gr4');
   const photo = useMemo(() => previewPhoto(), [rev]); // eslint-disable-line react-hooks/exhaustive-deps
   const ref = useRef<HTMLCanvasElement>(null);
   const showPhoto = backdrop === 'photo' && !!photo;
@@ -1047,7 +1052,7 @@ function RatioPane({ r }: { r?: RatioItem }) {
         <Segmented tour="ratio-backdrop" value={backdrop} onChange={setRatioBackdrop} options={[{ value: 'photo', label: t('previewPhoto') }, { value: 'gray', label: t('ratioGray') }]} />
       </div>
       <div className="ratio-body" data-tour="ratio-frame" data-tour-fit="">
-        <div className={`ratio-frame ${showPhoto ? '' : 'gray'}`}>
+        <div className={`ratio-frame ${showPhoto ? '' : 'gray'} ${gr4 ? 'camera-black' : ''} ${shade ? `live-shade tone-${tone}` : ''}`}>
           {showPhoto && <canvas ref={ref} className="ratio-photo" />}
           {sc && (
             <>
@@ -1078,6 +1083,8 @@ export function RatioPage() {
   const max = useStore((s) => maxRatios(s));
   const full = ratios.length >= max;
   const used = new Set(ratios.map((r) => r.ratio.trim()));
+  const shadeOk = !!info?.features.ratioShade;
+  const live = useStore((s) => liveViewOf(s));
   return (
     <DropZone className="page" accept={isFirmware} onFiles={(f) => { void loadFirmwareFile(f[0]); }}>
       <header className="page-head">
@@ -1103,8 +1110,146 @@ export function RatioPage() {
                 </div>
               </div>
             )}
+            {shadeOk && (
+              <div className="ratio-live" data-tour="ratio-live">
+                <span className="muted small">{t('ratioLive')}</span>
+                <Segmented<LiveView> value={live} onChange={setLiveView}
+                  options={[{ value: '100', label: '100%' }, { value: '50', label: '50%' }, { value: '25', label: '25%' }]} />
+                <p className="muted small">{t('ratioLiveTip')}</p>
+              </div>
+            )}
           </div>
           <RatioPane r={active} />
+        </div>
+      )}
+    </DropZone>
+  );
+}
+
+// ---------------------------------------------------------------- custom grid lines
+type GridStyle = 'g3' | 'g4';
+/** One line of a grid style, in the order core's CustomGrid keeps them; `at` is x1, y1, x2, y2 in the frame (0..1). */
+interface GridLineDef { group: 'h' | 'v' | 'd'; name: Key; at: readonly [number, number, number, number] }
+const gridLineDefs = (k: number): GridLineDef[] => [
+  { group: 'h', name: 'gridTop', at: [0, 1 / k, 1, 1 / k] },
+  { group: 'h', name: 'gridMiddle', at: [0, 1 / 2, 1, 1 / 2] },
+  { group: 'h', name: 'gridBottom', at: [0, 1 - 1 / k, 1, 1 - 1 / k] },
+  { group: 'v', name: 'gridLeft', at: [1 / k, 0, 1 / k, 1] },
+  { group: 'v', name: 'gridCentre', at: [1 / 2, 0, 1 / 2, 1] },
+  { group: 'v', name: 'gridRight', at: [1 - 1 / k, 0, 1 - 1 / k, 1] },
+  { group: 'd', name: 'gridDiagDown', at: [0, 0, 1, 1] },
+  { group: 'd', name: 'gridDiagUp', at: [0, 1, 1, 0] },
+];
+/** 3x3: thirds (the centre lines and diagonals are extra); 4x4: quarters, its centre lines and diagonals. */
+const GRID_LINES: Record<GridStyle, GridLineDef[]> = { g3: gridLineDefs(3), g4: gridLineDefs(4) };
+const GRID_GROUPS: { id: GridLineDef['group']; name: Key }[] = [{ id: 'h', name: 'gridHorizontal' }, { id: 'v', name: 'gridVertical' }, { id: 'd', name: 'gridDiagonals' }];
+/** The camera's grid colour: UI palette 16, black at 50 %. */
+const GRID_COLOUR = 'rgba(0,0,0,.5)';
+
+/** A plain stand-in for the live view: sky, a horizon, a path and a tree. */
+function GridScene() {
+  return (
+    <>
+      <defs>
+        <linearGradient id="grid-sky" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#5f7f9c" /><stop offset="0.55" stopColor="#a9b8c2" /><stop offset="0.56" stopColor="#6f7a56" /><stop offset="1" stopColor="#3e4632" />
+        </linearGradient>
+      </defs>
+      <rect x="0" y="0" width="720" height="480" fill="url(#grid-sky)" />
+      <path d="M300 480 L350 268 L372 268 L460 480 Z" fill="#8c8673" opacity="0.75" />
+      <rect x="500" y="170" width="12" height="110" fill="#3b3326" />
+      <circle cx="506" cy="160" r="52" fill="#2f3d27" />
+      <path d="M0 262 Q120 236 240 258 T480 252 T720 262 L720 270 L0 270 Z" fill="#55613f" opacity="0.8" />
+    </>
+  );
+}
+
+/** The custom grid's lines: a preview of the style (click a line to show or hide it) and a button per line. */
+function GridLinesEditor() {
+  const lines = useStore((s) => s.gridLines);
+  const [style, setStyle] = useState<GridStyle>('g3');
+  const defs = GRID_LINES[style];
+  const xy = (at: GridLineDef['at']) => ({ x1: at[0] * 720, y1: at[1] * 480, x2: at[2] * 720, y2: at[3] * 480 });
+  const toggle = (i: number): void => setGridLine(style, i, !lines[style][i]);
+  return (
+    <div className="grid-edit">
+      <Segmented<GridStyle> value={style} onChange={setStyle} options={[{ value: 'g3', label: t('grid3') }, { value: 'g4', label: t('grid4') }]} />
+      <div className="grid-edit-body">
+        <svg viewBox="0 0 720 480" className="grid-edit-preview">
+          <GridScene />
+          {defs.map((d, i) => (lines[style][i]
+            ? <line key={i} {...xy(d.at)} stroke={GRID_COLOUR} strokeWidth={5} />
+            : <line key={i} {...xy(d.at)} stroke="rgba(255,255,255,.5)" strokeWidth={3} strokeDasharray="14 12" />))}
+          {defs.map((d, i) => <line key={`hit${i}`} {...xy(d.at)} stroke="transparent" strokeWidth={40} className="grid-edit-hit" onClick={() => toggle(i)} />)}
+        </svg>
+        <div className="grid-edit-lines">
+          {GRID_GROUPS.map((g) => (
+            <div key={g.id} className="grid-edit-group">
+              <span className="muted small">{t(g.name)}</span>
+              <div className="chips">
+                {defs.map((d, i) => (d.group !== g.id ? null : (
+                  <button key={i} type="button" className="btn small" aria-pressed={lines[style][i]} onClick={() => toggle(i)}>{t(d.name)}</button>
+                )))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <p className="muted small">{t('gridHint')}</p>
+    </div>
+  );
+}
+
+/** The custom grid page: the switch, then the editor (dimmed while the switch is off). */
+export function GridPage() {
+  const info = useStore((s) => s.info);
+  const on = useStore((s) => s.customGrid);
+  const same = useStore((s) => isCameraGrid(s.gridLines));
+  return (
+    <DropZone className="page" accept={isFirmware} onFiles={(f) => { void loadFirmwareFile(f[0]); }}>
+      <header className="page-head">
+        <span className="page-icon">{Ico.grid}</span>
+        <h1>{t('navGridPage')}</h1>
+      </header>
+      {!info && <FirmwareHero />}
+      {info && (
+        <div className={`grid-page ${on ? '' : 'off'}`} data-tour-page="grid">
+          <div className="card extras">
+            <FeatureRow icon={Ico.grid} title={t('navGrid')} sub={t('gridSub')} on={on} onChange={setCustomGrid} tour="grid-switch" />
+          </div>
+          {on && same && <p className="muted small">{t('gridSameAsCamera')}</p>}
+          <GridLinesEditor />
+        </div>
+      )}
+    </DropZone>
+  );
+}
+
+// ---------------------------------------------------------------- battery percentage
+/** The icons the build adds, from full to nearly empty (100, 70, 40, 20, 10 %). */
+const BATTERY_PREVIEW = [10, 7, 4, 2, 1];
+
+export function BatteryPage() {
+  const info = useStore((s) => s.info);
+  const battery = useStore((s) => s.battery);
+  const icons = useMemo(() => { const all = batteryIcons(); return BATTERY_PREVIEW.map((step) => all[step - 1]); }, []);
+  return (
+    <DropZone className="page" accept={isFirmware} onFiles={(f) => { void loadFirmwareFile(f[0]); }}>
+      <header className="page-head">
+        <span className="page-icon">{Ico.battery}</span>
+        <h1>{t('navBatteryPage')}</h1>
+      </header>
+      {!info && <FirmwareHero />}
+      {info && (
+        <div className="battery-page" data-tour-page="battery">
+          <div className="card extras">
+            <FeatureRow icon={Ico.battery} title={t('navBattery')} sub={t('batterySub')} on={battery} onChange={setBattery} tour="battery-switch" />
+          </div>
+          <div className="battery-look">
+            <span className="muted small">{t('batteryLook')}</span>
+            <div className="battery-icons">{icons.map((x) => <RatioIcon key={x.id} pixels={x.px} width={120} />)}</div>
+          </div>
+          <p className="muted small">{t('batteryNote')}</p>
         </div>
       )}
     </DropZone>
